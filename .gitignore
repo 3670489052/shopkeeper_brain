@@ -1,0 +1,6 @@
+*.exe
+*.msi
+*.zip
+mongodb/
+__pycache__/
+*.pyc
