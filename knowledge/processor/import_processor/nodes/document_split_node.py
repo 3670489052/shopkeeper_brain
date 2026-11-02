@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from knowledge.processor.import_processor.base import BaseNode
 from knowledge.processor.import_processor.config import ImportConfig
 from knowledge.processor.import_processor.state import ImportGraphState
@@ -21,8 +23,14 @@ class DocumentSplitNode(BaseNode):
         #     print(section)
         #3 二次切分或者合并
         final_sections=self.split_and_merge(sections_by_head,max_chunk_length,min_chunk_length)
+        
         #4 将切分完的内容 组装成后续节点可以使用的chunks
+        chunks=self.assemble_chunks(final_sections)
+        
         #5 将chunks转化成json格式 以便后续测试
+        self.backup_chunks(chunks,state)
+        state["chunks"]=chunks
+        return state
     
     def validate_state(self,state:ImportGraphState,config:ImportConfig)->Tuple[str,str,int,int]:
         #1 统一换行符 将\r\n 替换成 \n
@@ -87,6 +95,8 @@ class DocumentSplitNode(BaseNode):
             #判断是否存在current_title 是否存在body 如果都不存在 就不收集该段内容
             if not title and not body:
                 return
+            #如果title没有值 就用file_title进行兜底
+            title=title if title else file_title
             #收集父标题
             parent_title=""
             for i in range(current_level-1,0,-1):
@@ -95,8 +105,8 @@ class DocumentSplitNode(BaseNode):
                     break
             section={
                 "body":body,
-                "title":title if title else file_title,
-                "parent_title":parent_title if parent_title else file_title,
+                "title":title,
+                "parent_title":parent_title if parent_title else title,
                 "file_title":file_title
                 }
             #将section添加到final_sections中
@@ -137,12 +147,12 @@ class DocumentSplitNode(BaseNode):
         for section in sections_by_head:
             split_sections=self.split_long_section(section,max_chunk_length)
             current_section.extend(split_sections)
-        for section in current_section:
-            print("标题：", section["title"])
-            print("正文：", section["body"])
-            print("-" * 50)
+        # for section in current_section:
+        #     print("标题：", section["title"])
+        #     print("正文：", section["body"])
+        #     print("-" * 50)
         #3 针对小的section进行合并
-        final_sections=[]
+        final_sections=self.merge_short_section(current_section,min_chunk_length)
         #4 返回二次切分和合并的section
         return final_sections
 
@@ -193,6 +203,112 @@ class DocumentSplitNode(BaseNode):
             }
             result_sections.append(new_section)
         return result_sections
+    #合并短的section
+    def merge_short_section(self,current_section:List[Dict[str,Any]],min_content_length:int)->List[Dict[str,Any]]:
+        """
+        2. 合并短的section
+   1. 获取下标为0的section，记录为current_section
+   2. 定义final_sections用于收集合并后的section列表
+   3. 从下标为1的section遍历到最后，遍历出来的section记录为next_section
+      1. 判断next_section与current_section是否是同源：parent_title是否相同
+      2. 判断current_section的长度是否小于min_content_length
+      3. 如果上面两个条件都满足，则使用current_section合并next_section：
+         1. 使用"\n\n"拼接current_section与next_section的body
+         2. 将合并后的section的标题title设置成它的parent_title，因为合并后细粒的标题就不合适，改成parent_title最合适
+      4. 如果不满足，则表示当前section不需要合并：
+         1. 将current_section添加到final_sections中
+         2. 将current_section的游标指向next_section继续往下遍历
+   4. 遍历完之后，将最后一个current_section添加到final_sections中
+   5. 返回final_sections
+    """
+        #1 获取下标为0的section，记录为current_section
+        sections=current_section
+        if not sections:
+            return []
+        current_section=sections[0]
+        #2. 定义final_sections用于收集合并后的section列表
+        final_sections=[]
+        #3. 从下标为1的section遍历到最后，遍历出来的section记录为next_section
+        for i in range(1, len(sections)):
+            next_section=sections[i]
+
+            #3.1 判断next_section与current_section是否是同源：parent_title是否相同
+            same_title=next_section["parent_title"]==current_section["parent_title"]
+            #3.2 判断current_section的长度是否小于min_content_length
+            current_length=len(current_section["body"])
+            is_short=current_length<min_content_length
+            #3.3 如果上面两个条件都满足，则使用current_section合并next_section：
+            if same_title and is_short:
+                #3.3.1. 使用"\n\n"拼接current_section与next_section的body
+                current_section["body"]+="\n\n"+next_section["body"]
+               #3.3.2. 将合并后的section的标题title设置成它的parent_title，因为合并后细粒的标题就不合适，改成parent_title最合适
+                current_section["title"]=current_section["parent_title"]
+            #4. 如果不满足，则表示当前section不需要合并：
+            else:
+                #4.1 将current_section添加到final_sections中
+                final_sections.append(current_section)
+                #4.2 将current_section的游标指向next_section继续往下遍历
+                current_section=next_section
+        #5. 遍历完之后，将最后一个current_section添加到final_sections中
+        final_sections.append(current_section)
+        #6. 返回final_sections
+        return final_sections
+
+    #将切分完的内容 组装成后续节点可以使用的chunks
+    def assemble_chunks(self,final_sections:List[Dict[str,Any]])->List[Dict[str,Any]]:
+        """
+         原本的section
+        {
+                "body":"内容正文",
+                "title":"这块的标题",
+                "parent_title":"这块的父标题",
+                "file_title":"文件标题",
+                }
+
+        真正需要的chunk
+        {
+        "content":"内容正文 是title拼接body的内容",
+        "title":"这块的标题",
+        "parent_title":"这块的父标题",
+        "file_title":"文件标题",
+        }
+        """
+        chunks=[]
+        for section in final_sections:
+            title=section.get("title","")
+            body=section.get("body","")
+            chunk={
+                "content":title+"\n\n"+body,
+                "title":title,
+                "parent_title":section.get("parent_title",""),
+                "file_title":section.get("file_title","")
+
+            }
+            chunks.append(chunk)
+        return chunks
+    #备份chunks
+    def backup_chunks(self,chunks:List[Dict[str,Any]],state:ImportGraphState):
+        #1 指定备份文件的路径
+        #1.1 获取文件输出的目录
+        md_path=state.get("md_path","")
+        md_path_obj=Path(md_path)
+        file_dir_obj=Path(state.get("file_dir",""))
+        backup_dir=file_dir_obj/md_path_obj.stem
+        #1.2 判断目录是否存在 如果不存在就创建目录
+        backup_dir.mkdir(parents=True,exist_ok=True)
+        #1.3 指定备份文件的路径
+        backup_file_path=backup_dir/"chunks.json"
+        #2 将chunk写入备份文件中
+        try:
+            with open(backup_file_path,"w",encoding="utf-8") as f:
+                import json
+                json.dump(chunks,f,ensure_ascii=False,indent=4)
+        except Exception as e:
+            self.logger.warning(f"{md_path_obj.stem},文件备份成json文件失败  但是不影响主流程")
+
+
+
+
 
 
 
@@ -203,10 +319,11 @@ class DocumentSplitNode(BaseNode):
 if __name__=="__main__":
     #1 将new_md的内容读取出来
     document_split_node=DocumentSplitNode()
-    md_path="D:\python\shopkeeper-brain\knowledge\processor\input_dir\split_debug_distinct.md"
+    md_path = r"D:/python/shopkeeper-brain/knowledge/processor/import_processor/output_dir/万用表RS-12的使用/万用表RS-12的使用_new.md"
     with open(md_path,"r",encoding="utf-8") as f:
         md_content=f.read()
     init_state={
+        "md_path":md_path,
         "md_content":md_content,
         "file_title":"split_document",
         "file_dir":"D:\python\shopkeeper-brain\knowledge\processor\input_dir"
